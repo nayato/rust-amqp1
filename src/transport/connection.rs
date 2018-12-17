@@ -1,25 +1,71 @@
-use futures::prelude::*;
-use futures::{future, AsyncSink, Future, Sink, Stream};
-use futures::unsync::oneshot;
-use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_io::codec::Framed;
-use tokio_core::reactor;
-
-use errors::*;
-use io::AmqpCodec;
-use framing::AmqpFrame;
-use bytes::Bytes;
-
-use std::rc::{Rc, Weak};
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::marker::PhantomData;
+use std::rc::{Rc, Weak};
+
+use actix_connector::{Connect, RequestHost};
+use actix_service::Service;
+use bytes::Bytes;
+use futures::prelude::*;
+use futures::stream::{SplitSink, SplitStream};
+use futures::unsync::oneshot;
+use futures::{future, AsyncSink, Future, Poll, Sink, Stream};
+use tokio_codec::Framed;
+use tokio_io::{AsyncRead, AsyncWrite};
+
+use errors::Error;
+use framing::AmqpFrame;
+use io::AmqpCodec;
 
 use super::session::*;
 use super::*;
 
-#[derive(Clone)]
-pub struct Connection {
+pub struct ConnectionHandshake<Io> {
+    io: PhantomData<Io>,
+}
+
+impl<Io> ConnectionHandshake<Io>
+where
+    Io: AsyncRead + AsyncWrite + 'static,
+{
+    pub fn new() -> Self {
+        ConnectionHandshake { io: PhantomData }
+    }
+}
+
+impl<Io> Clone for ConnectionHandshake<Io>
+where
+    Io: AsyncRead + AsyncWrite + 'static,
+{
+    fn clone(&self) -> Self {
+        ConnectionHandshake { io: PhantomData }
+    }
+}
+
+impl<Io> Service<(Connect, Io)> for ConnectionHandshake<Io>
+where
+    Io: AsyncRead + AsyncWrite + 'static,
+{
+    type Response = Connection<Io>;
+    type Error = Error;
+    type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
+
+    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+        Ok(Async::Ready(()))
+    }
+
+    fn call(&mut self, (conn, stream): (Connect, Io)) -> Self::Future {
+        Box::new(negotiate_protocol(ProtocolId::Amqp, stream).and_then(move |io| {
+            let io = Framed::new(io, AmqpCodec::<AmqpFrame>::new());
+            open_connection(&conn.host(), io).map(|io| Connection::new(io))
+        }))
+    }
+}
+
+pub struct Connection<T: AsyncRead + AsyncWrite + 'static> {
     inner: Rc<RefCell<ConnectionInner>>,
+    reader: SplitStream<Framed<T, AmqpCodec<AmqpFrame>>>,
+    transport: ConnectionTransport<SplitSink<Framed<T, AmqpCodec<AmqpFrame>>>>,
 }
 
 pub(crate) struct ConnectionInner {
@@ -41,40 +87,16 @@ struct ConnectionTransport<T: Sink<SinkItem = AmqpFrame, SinkError = Error> + 's
     flushed: bool,
 }
 
-impl Connection {
-    #[async]
-    pub fn open<T: AsyncRead + AsyncWrite + 'static>(hostname: String, handle: reactor::Handle, io: T) -> Result<Connection> {
-        let io = await!(negotiate_protocol(ProtocolId::Amqp, io))?;
-
-        let io = io.framed(AmqpCodec::<AmqpFrame>::new());
-        let io = await!(open_connection(hostname, io))?;
-        Ok(Connection::new(handle, io))
-    }
-
-    fn new<T: AsyncRead + AsyncWrite + 'static>(handle: reactor::Handle, io: Framed<T, AmqpCodec<AmqpFrame>>) -> Connection {
+impl<T: AsyncRead + AsyncWrite> Connection<T> {
+    fn new(io: Framed<T, AmqpCodec<AmqpFrame>>) -> Connection<T> {
         let (writer, reader) = io.split();
-        let connection = Rc::new(RefCell::new(ConnectionInner::new()));
-        let conn_transport = ConnectionTransport {
+        let inner = Rc::new(RefCell::new(ConnectionInner::new()));
+        let transport = ConnectionTransport {
             sink: writer,
-            connection: connection.clone(),
+            connection: inner.clone(),
             flushed: true,
         };
-        let reader_conn = connection.clone();
-        let read_handling = reader.for_each(move |frame| {
-            reader_conn
-                .borrow_mut()
-                .handle_frame(frame, reader_conn.clone());
-            Ok(())
-        });
-        handle.spawn(read_handling.map_err(|e| {
-            // todo: handle error while reading
-            println!("AMQP: Error reading: {:?}", e);
-        }));
-        handle.spawn(conn_transport.map_err(|e| {
-            // todo: handle error while writing
-            println!("AMQP: Error writing: {:?}", e);
-        }));
-        Connection { inner: connection }
+        Connection { inner, reader, transport }
     }
 
     pub fn close() -> impl Future<Item = (), Error = Error> {
@@ -84,6 +106,39 @@ impl Connection {
     /// Opens the session
     pub fn open_session(&self) -> impl Future<Item = Session, Error = Error> {
         self.inner.borrow_mut().open_session()
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite> Future for Connection<T> {
+    type Item = ();
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<(), ()> {
+        loop {
+            match self.reader.poll() {
+                Ok(Async::Ready(Some(frame))) => {
+                    self.inner.borrow_mut().handle_frame(frame, self.inner.clone());
+                }
+                Ok(Async::Ready(None)) => return Err(()),
+                Ok(Async::NotReady) => break,
+                Err(e) => {
+                    warn!("AMQP: Error reading: {:?}", e);
+                    return Err(());
+                }
+            }
+        }
+
+        match self.transport.poll() {
+            Ok(Async::Ready(_)) => return Err(()),
+            Ok(Async::NotReady) => (),
+            Err(e) => {
+                // todo: handle error while writing
+                warn!("AMQP: Error writing: {:?}", e);
+                return Err(());
+            }
+        }
+
+        Ok(Async::NotReady)
     }
 }
 
@@ -182,17 +237,12 @@ impl ConnectionInner {
             // todo: handle Close, End?
             Frame::End(_) | Frame::Close(_) => {
                 println!("todo: unexpected frame: {:#?}", frame);
-            },
-            _ => () // todo: handle unexpected frames
+            }
+            _ => (), // todo: handle unexpected frames
         }
 
-        if let Some(session) = self.sessions
-            .get(frame.channel_id() as u32)
-            .and_then(|sr| sr.upgrade())
-        {
-            session
-                .borrow_mut()
-                .handle_frame(frame, session.clone(), self);
+        if let Some(session) = self.sessions.get(frame.channel_id() as u32).and_then(|sr| sr.upgrade()) {
+            session.borrow_mut().handle_frame(frame, session.clone(), self);
         } else {
             // todo: missing session
             println!("todo: missing session: {}", frame.channel_id());
@@ -200,10 +250,7 @@ impl ConnectionInner {
     }
 
     fn complete_session_creation(&mut self, channel_id: u16, begin: &Begin, self_rc: Rc<RefCell<ConnectionInner>>) {
-        if let Some(index) = self.pending_sessions
-            .iter()
-            .position(|r| r.channel == channel_id)
-        {
+        if let Some(index) = self.pending_sessions.iter().position(|r| r.channel == channel_id) {
             let req = self.pending_sessions.remove(index);
             let session = Rc::new(RefCell::new(SessionInner::new(
                 self_rc,
@@ -212,8 +259,7 @@ impl ConnectionInner {
                 begin.next_outgoing_id(),
                 begin.outgoing_window(),
             )));
-            self.sessions
-                .set(req.channel as u32, Rc::downgrade(&session));
+            self.sessions.set(req.channel as u32, Rc::downgrade(&session));
             let _ = req.promise.send(Session::new(session));
         } else {
             // todo: rogue begin right now - do nothing. in future might indicate incoming attach
@@ -239,18 +285,13 @@ impl ConnectionInner {
             desired_capabilities: None,
             properties: None,
         };
-        self.post_frame(AmqpFrame::new(
-            local_channel,
-            Frame::Begin(begin),
-            Bytes::new(),
-        ));
+        self.post_frame(AmqpFrame::new(local_channel, Frame::Begin(begin), Bytes::new()));
         rx.map_err(|e| "Canceled".into())
     }
 }
 
 /// Performs connection opening.
-#[async]
-fn open_connection<T>(hostname: String, io: T) -> Result<T>
+fn open_connection<T>(hostname: &str, io: T) -> impl Future<Item = T, Error = Error>
 where
     T: Stream<Item = AmqpFrame, Error = Error> + Sink<SinkItem = AmqpFrame, SinkError = Error> + 'static,
 {
@@ -266,22 +307,18 @@ where
         desired_capabilities: None,
         properties: None,
     };
-    let io = await!(io.send(AmqpFrame::new(0, Frame::Open(open), Bytes::new())))?;
-    let (frame_opt, io) = await!(io.into_future()).map_err(|e| e.0)?;
 
-    if let Some(frame) = frame_opt {
-        //println!("rx: {:?}", frame);
-        if let Frame::Open(ref open) = *frame.performative() {
-            Ok(io)
-        } else {
-            Err(
-                format!(
-                    "Expected Open performative to arrive, seen `{:?}` instead.",
-                    frame
-                ).into(),
-            )
-        }
-    } else {
-        Err("Connection is closed.".into())
-    }
+    io.send(AmqpFrame::new(0, Frame::Open(open), Bytes::new())).and_then(|io| {
+        io.into_future().map_err(|e| e.0).and_then(|(frame_opt, io)| {
+            if let Some(frame) = frame_opt {
+                if let Frame::Open(ref open) = *frame.performative() {
+                    Ok(io)
+                } else {
+                    Err(format!("Expected Open performative to arrive, seen `{:?}` instead.", frame).into())
+                }
+            } else {
+                Err("Connection is closed.".into())
+            }
+        })
+    })
 }

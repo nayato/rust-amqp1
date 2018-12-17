@@ -1,22 +1,23 @@
-#![feature(proc_macro, generators, vec_resize_default)]
-#![feature(trace_macros)]
-
+extern crate actix_connector;
+extern crate actix_service;
 extern crate bytes;
 extern crate chrono;
-extern crate uuid;
+extern crate futures;
 extern crate ordered_float;
+extern crate tokio_codec;
+extern crate tokio_current_thread;
+extern crate tokio_io;
+extern crate uuid;
 #[macro_use]
 extern crate error_chain;
-extern crate tokio_io;
-extern crate tokio_core;
 #[macro_use]
-extern crate futures_await as futures;
+extern crate log;
 
 #[macro_use]
 pub mod codec;
+mod errors;
 pub mod framing;
 pub mod types;
-mod errors;
 pub use errors::*; // todo: revisit API guidelines for this
 pub mod io;
 pub mod protocol;
